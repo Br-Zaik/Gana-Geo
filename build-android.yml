@@ -1,0 +1,134 @@
+name: Crear APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Crear APK Debug
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v6
+
+      - name: Localizar o extraer proyecto Android
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SETTINGS_FILE="$(find . -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print -quit)"
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            ZIP_FILE="$(find . -maxdepth 2 -type f -name '*.zip' -print -quit)"
+
+            if [ -z "$ZIP_FILE" ]; then
+              echo "::error::No se encontró un proyecto Android ni un archivo ZIP para extraer."
+              echo "Archivos actuales:"
+              find . -maxdepth 3 -type f -print
+              exit 1
+            fi
+
+            echo "Extrayendo: $ZIP_FILE"
+            rm -rf extracted-project
+            mkdir -p extracted-project
+            unzip -q "$ZIP_FILE" -d extracted-project
+
+            SETTINGS_FILE="$(find extracted-project -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print -quit)"
+          fi
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::El ZIP no contiene settings.gradle ni settings.gradle.kts."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          PROJECT_DIR="${PROJECT_DIR#./}"
+
+          echo "Proyecto Android encontrado en: $PROJECT_DIR"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+          find "$PROJECT_DIR" -maxdepth 2 -type f -print | sort
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar Android 36
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Configurar Gradle 8.13
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.13"
+          cache-provider: basic
+          validate-wrappers: false
+
+      - name: Crear configuración de Supabase
+        shell: bash
+        env:
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          {
+            echo "SUPABASE_URL=https://pnbpeehcbqkdhjueyldn.supabase.co"
+            echo "SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}"
+          } > "$PROJECT_DIR/local.properties"
+
+          if [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::warning::No configuraste el secreto SUPABASE_ANON_KEY. El APK puede compilar, pero el acceso al servidor no funcionará."
+          fi
+
+      - name: Compilar APK Debug
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          gradle -p "$PROJECT_DIR" :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Recoger APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+          APK="$(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/debug/*.apk' -print -quit)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::La compilación terminó, pero no se encontró el APK."
+            find "$PROJECT_DIR" -path '*/build/outputs/*' -type f -print || true
+            exit 1
+          fi
+
+          cp "$APK" "artifacts/Gana-Geo-debug-${GITHUB_RUN_NUMBER}.apk"
+          ls -lh artifacts
+
+      - name: Subir APK descargable
+        uses: actions/upload-artifact@v7
+        with:
+          name: Gana-Geo-APK-${{ github.run_number }}
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
