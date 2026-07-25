@@ -1,0 +1,145 @@
+name: Crear APK CORREGIDO
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  crear-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v6
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Buscar o extraer proyecto Android
+        id: proyecto
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Archivos actuales:"
+          find . -maxdepth 3 -type f | sort
+
+          # Si el proyecto está comprimido, extraer todos los ZIP.
+          if ! find . -type f -name "gradlew" | grep -q .; then
+            while IFS= read -r -d '' ZIP; do
+              echo "Extrayendo: $ZIP"
+              DESTINO="extraido-$(basename "$ZIP" .zip)"
+              mkdir -p "$DESTINO"
+              unzip -o "$ZIP" -d "$DESTINO"
+            done < <(find . -type f -iname "*.zip" -print0)
+          fi
+
+          # Encontrar una carpeta que contenga gradlew y settings.gradle.
+          DIRECTORIO=""
+
+          while IFS= read -r ARCHIVO; do
+            POSIBLE="$(dirname "$ARCHIVO")"
+
+            if [ -f "$POSIBLE/settings.gradle" ] || \
+               [ -f "$POSIBLE/settings.gradle.kts" ]; then
+              DIRECTORIO="$POSIBLE"
+              break
+            fi
+          done < <(find . -type f -name "gradlew")
+
+          if [ -z "$DIRECTORIO" ]; then
+            echo "::error::No se encontró un proyecto Android completo."
+            echo "::error::Faltan gradlew y settings.gradle o settings.gradle.kts."
+            echo "::error::Debes subir el proyecto Android completo o su ZIP."
+            exit 1
+          fi
+
+          DIRECTORIO="$(realpath --relative-to="$GITHUB_WORKSPACE" "$DIRECTORIO")"
+
+          echo "Proyecto encontrado en: $DIRECTORIO"
+          echo "dir=$DIRECTORIO" >> "$GITHUB_OUTPUT"
+
+          chmod +x "$DIRECTORIO/gradlew"
+
+          # Ayuda a Gradle a localizar el Android SDK.
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > "$DIRECTORIO/local.properties"
+
+      - name: Verificar proyecto
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DIR="${{ steps.proyecto.outputs.dir }}"
+
+          echo "Directorio: $DIR"
+          ls -la "$DIR"
+
+          test -f "$DIR/gradlew"
+
+          if [ ! -f "$DIR/settings.gradle" ] && \
+             [ ! -f "$DIR/settings.gradle.kts" ]; then
+            echo "::error::No existe settings.gradle ni settings.gradle.kts."
+            exit 1
+          fi
+
+      - name: Compilar APK Debug
+        shell: bash
+        env:
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+
+          DIR="${{ steps.proyecto.outputs.dir }}"
+          cd "$DIR"
+
+          ./gradlew assembleDebug \
+            --no-daemon \
+            --stacktrace
+
+      - name: Recoger APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DIR="${{ steps.proyecto.outputs.dir }}"
+          mkdir -p "$GITHUB_WORKSPACE/apk"
+
+          CONTADOR=0
+
+          while IFS= read -r -d '' ARCHIVO; do
+            CONTADOR=$((CONTADOR + 1))
+            NOMBRE="Gana-Geo-debug-${CONTADOR}.apk"
+
+            cp "$ARCHIVO" "$GITHUB_WORKSPACE/apk/$NOMBRE"
+            echo "APK encontrado: $ARCHIVO"
+          done < <(
+            find "$DIR" \
+              -type f \
+              -path "*/build/outputs/apk/*/*.apk" \
+              ! -name "*androidTest*.apk" \
+              -print0
+          )
+
+          if [ "$CONTADOR" -eq 0 ]; then
+            echo "::error::La compilación terminó, pero no se encontró el APK."
+            exit 1
+          fi
+
+          ls -lh "$GITHUB_WORKSPACE/apk"
+
+      - name: Subir APK para descargar
+        uses: actions/upload-artifact@v5
+        with:
+          name: Gana-Geo-APK
+          path: apk/*.apk
+          if-no-files-found: error
+          retention-days: 30
