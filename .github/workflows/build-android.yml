@@ -1,0 +1,131 @@
+name: Compilar APK automáticamente
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Crear APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # 1. Descarga todos los archivos del repositorio.
+      - name: Descargar proyecto
+        uses: actions/checkout@v6
+
+      # 2. Configura Java para compilar Android.
+      - name: Configurar Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 3. Configura Gradle y guarda dependencias en caché.
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      # 4. Comprueba que realmente sea un proyecto Android.
+      - name: Verificar archivos del proyecto
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -f "gradlew" ]; then
+            echo "::error::No se encontró el archivo gradlew."
+            echo "::error::Debes subir el proyecto Android completo al repositorio."
+            exit 1
+          fi
+
+          if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
+            echo "::error::No se encontró settings.gradle ni settings.gradle.kts."
+            exit 1
+          fi
+
+          chmod +x gradlew
+
+      # 5. Compila todos los módulos Android que tengan versión Debug.
+      - name: Compilar APK Debug
+        shell: bash
+        run: |
+          ./gradlew assembleDebug \
+            --no-daemon \
+            --stacktrace
+
+      # 6. Busca automáticamente todos los APK creados.
+      - name: Recoger y renombrar APK
+        id: apks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts
+
+          # Lee automáticamente el nombre del repositorio.
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+
+          # Convierte el nombre en uno seguro para los archivos.
+          SAFE_NAME="$(printf '%s' "$REPO_NAME" \
+            | tr '[:space:]' '-' \
+            | tr -cd '[:alnum:]._-')"
+
+          COUNT=0
+
+          while IFS= read -r -d '' APK_PATH; do
+            COUNT=$((COUNT + 1))
+
+            # Detecta automáticamente el módulo que generó el APK.
+            MODULE_NAME="$(printf '%s' "$APK_PATH" \
+              | sed 's#^\./##' \
+              | sed 's#/build/outputs/apk/.*##' \
+              | tr '/' '-')"
+
+            ORIGINAL_NAME="$(basename "$APK_PATH" .apk)"
+
+            NEW_NAME="${SAFE_NAME}-${MODULE_NAME}-${ORIGINAL_NAME}.apk"
+
+            cp "$APK_PATH" "artifacts/$NEW_NAME"
+
+            echo "APK encontrado: $APK_PATH"
+            echo "Guardado como: artifacts/$NEW_NAME"
+
+          done < <(
+            find . \
+              -type f \
+              -path "*/build/outputs/apk/*.apk" \
+              ! -name "*androidTest*.apk" \
+              -print0
+          )
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::Gradle terminó, pero no se encontró ningún APK."
+            echo "::error::Revisa si tu proyecto usa otro tipo de compilación."
+            exit 1
+          fi
+
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Se encontraron $COUNT APK."
+          ls -lh artifacts
+
+      # 7. Deja los APK disponibles para descargar en GitHub Actions.
+      - name: Subir APK para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-APK-${{ github.run_number }}
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
