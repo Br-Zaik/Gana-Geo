@@ -1,0 +1,173 @@
+name: Crear APK CORREGIDO
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  crear-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Restaurar firma Debug estable
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: ganageo-debug-keystore-v1
+
+      - name: Preparar firma Debug estable y mostrar SHA-1
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android"
+
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000
+          fi
+
+          echo "============================================================"
+          echo "COPIA ESTA SHA-1 PARA GOOGLE CLOUD"
+
+          keytool -list -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey | grep "SHA1:"
+
+          echo "PAQUETE: com.ganageo.app"
+          echo "============================================================"
+
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar Android 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Configurar Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Buscar o extraer proyecto Android
+        id: proyecto
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="$(find "$GITHUB_WORKSPACE" \
+            -type f \
+            -name settings.gradle.kts \
+            -not -path '*/.git/*' \
+            -printf '%h\n' | head -n 1 || true)"
+
+          if [ -z "$PROJECT_DIR" ]; then
+            ZIP_FILE="$(find "$GITHUB_WORKSPACE" \
+              -maxdepth 2 \
+              -type f \
+              -iname '*.zip' | head -n 1 || true)"
+
+            if [ -z "$ZIP_FILE" ]; then
+              echo "No se encontró un proyecto Android ni un archivo ZIP." >&2
+              exit 1
+            fi
+
+            rm -rf "$RUNNER_TEMP/ganageo-project"
+            mkdir -p "$RUNNER_TEMP/ganageo-project"
+            unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/ganageo-project"
+
+            PROJECT_DIR="$(find "$RUNNER_TEMP/ganageo-project" \
+              -type f \
+              -name settings.gradle.kts \
+              -printf '%h\n' | head -n 1 || true)"
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "No se encontró settings.gradle.kts después de extraer el ZIP." >&2
+            exit 1
+          fi
+
+          echo "Proyecto encontrado en: $PROJECT_DIR"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Verificar proyecto
+        shell: bash
+        working-directory: ${{ steps.proyecto.outputs.dir }}
+        run: |
+          set -euo pipefail
+          test -f settings.gradle.kts
+          test -f app/build.gradle.kts
+          echo "Proyecto Android verificado."
+
+      - name: Compilar APK Debug
+        shell: bash
+        working-directory: ${{ steps.proyecto.outputs.dir }}
+        env:
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+          gradle --no-daemon :app:assembleDebug
+
+      - name: Recoger APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_FILE="$(find '${{ steps.proyecto.outputs.dir }}/app/build/outputs/apk/debug' \
+            -type f \
+            -name '*.apk' | head -n 1)"
+
+          test -n "$APK_FILE"
+
+          mkdir -p "$GITHUB_WORKSPACE/apk-salida"
+
+          cp "$APK_FILE" \
+            "$GITHUB_WORKSPACE/apk-salida/Gana-Geo-v8-debug.apk"
+
+          echo "path=$GITHUB_WORKSPACE/apk-salida/Gana-Geo-v8-debug.apk" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Verificar firma del APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" \
+            -type f \
+            -name apksigner | sort -V | tail -n 1)"
+
+          "$APKSIGNER" verify \
+            --print-certs \
+            "${{ steps.apk.outputs.path }}" \
+            | grep -E 'Signer #1 certificate SHA-1 digest|Signer #1 certificate DN' \
+            || true
+
+      - name: Subir APK para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gana-Geo-APK
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
