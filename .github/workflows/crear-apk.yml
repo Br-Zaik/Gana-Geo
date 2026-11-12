@@ -20,41 +20,25 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Restaurar firma Debug estable
-        uses: actions/cache@v4
-        with:
-          path: ~/.android/debug.keystore
-          key: ganageo-debug-keystore-v1
-
-      - name: Preparar firma Debug estable y mostrar SHA-1
+      - name: Restaurar firma permanente desde GitHub Secrets
         shell: bash
+        env:
+          ANDROID_DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.android"
-
-          if [ ! -f "$HOME/.android/debug.keystore" ]; then
-            keytool -genkeypair \
-              -keystore "$HOME/.android/debug.keystore" \
-              -storepass android \
-              -alias androiddebugkey \
-              -keypass android \
-              -dname "CN=Android Debug,O=Android,C=US" \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000
+          if [ -z "$ANDROID_DEBUG_KEYSTORE_BASE64" ]; then
+            echo 'ERROR: Falta ANDROID_DEBUG_KEYSTORE_BASE64 en los secretos de GitHub.' >&2
+            exit 1
           fi
-
-          echo "============================================================"
-          echo "COPIA ESTA SHA-1 PARA GOOGLE CLOUD"
-
+          umask 077
+          mkdir -p "$RUNNER_TEMP/ganageo-firma"
+          printf '%s' "$ANDROID_DEBUG_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/ganageo-firma/debug.keystore"
+          test -s "$RUNNER_TEMP/ganageo-firma/debug.keystore"
           keytool -list -v \
-            -keystore "$HOME/.android/debug.keystore" \
+            -keystore "$RUNNER_TEMP/ganageo-firma/debug.keystore" \
             -storepass android \
-            -alias androiddebugkey | grep "SHA1:"
-
-          echo "PAQUETE: com.ganageo.app"
-          echo "============================================================"
-
+            -alias androiddebugkey | grep 'SHA1:'
+          echo 'Firma permanente recuperada y validada.'
       - name: Configurar Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -132,6 +116,10 @@ jobs:
         env:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
+          ANDROID_DEBUG_KEYSTORE: ${{ runner.temp }}/ganageo-firma/debug.keystore
+          ANDROID_DEBUG_STORE_PASSWORD: android
+          ANDROID_DEBUG_KEY_ALIAS: androiddebugkey
+          ANDROID_DEBUG_KEY_PASSWORD: android
         run: |
           set -euo pipefail
           gradle --no-daemon :app:assembleDebug
@@ -167,24 +155,30 @@ jobs:
           echo "path=$GITHUB_WORKSPACE/apk-salida/Gana-Geo-$VERSION-debug.apk" \
             >> "$GITHUB_OUTPUT"
 
-      - name: Verificar firma del APK
+      - name: Verificar que la firma del APK sea la permanente
         shell: bash
         run: |
           set -euo pipefail
-
-          APKSIGNER="$(find "$ANDROID_HOME/build-tools" \
-            -type f \
-            -name apksigner | sort -V | tail -n 1)"
-
-          "$APKSIGNER" verify \
-            --print-certs \
-            "${{ steps.apk.outputs.path }}" \
-            | grep -E 'Signer #1 certificate SHA-1 digest|Signer #1 certificate DN' \
-            || true
-
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          EXPECTED="$(keytool -list -v -keystore "$RUNNER_TEMP/ganageo-firma/debug.keystore" -storepass android -alias androiddebugkey | sed -n 's/.*SHA1: //p' | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          ACTUAL="$("$APKSIGNER" verify --print-certs "${{ steps.apk.outputs.path }}" | sed -n 's/.*SHA-1 digest: //p' | head -n 1 | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          echo "SHA-1 de la firma: $EXPECTED"
+          echo "SHA-1 del APK:   $ACTUAL"
+          test -n "$EXPECTED"
+          test -n "$ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo 'ERROR: El APK no utiliza la firma permanente.' >&2
+            exit 1
+          fi
       - name: Subir APK para descargar
         uses: actions/upload-artifact@v4
         with:
           name: Gana-Geo-APK
           path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
+
+      - name: Eliminar archivo de firma temporal del runner
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/ganageo-firma/debug.keystore"
